@@ -1,0 +1,68 @@
+name: flashnext-sm120
+
+# Builds and pushes ghcr.io/dbirks/vllm-flashnext — a thin PLE-quant overlay on top of
+# vllm/vllm-openai:qwen38-flash-next for serving Qwen3.8-Flash-Next on RTX PRO 6000 (SM120).
+# Standalone; does not touch vLLM's own CI. See docker/flashnext-sm120/README.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to publish (ghcr.io/dbirks/vllm-flashnext:<tag>)"
+        required: false
+        default: "sm120"
+  push:
+    branches:
+      - flashnext-sm120
+    paths:
+      - "docker/flashnext-sm120/**"
+      - ".github/workflows/flashnext-sm120.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/dbirks/vllm-flashnext
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - name: Resolve tag
+        id: meta
+        run: echo "tag=${{ github.event.inputs.tag || 'sm120' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/flashnext-sm120
+          file: docker/flashnext-sm120/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
