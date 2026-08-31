@@ -1,27 +1,21 @@
-diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
-index c8ccde34fee4..1385edd27fd3 100644
 --- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
 +++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
-@@ -102,6 +102,15 @@ def __init__(
+@@ -104,6 +104,7 @@
              self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
              self._mamba_group_ids: list[int] = []
              self._mamba_spec: MambaSpec | None = None
 +            self._mamba_block_size: int | None = None
-+
-+    @staticmethod
-+    def _seed_state_block_idx(num_computed_tokens: int, mamba_block_size: int) -> int:
-+        """Mamba block of the last computed token; -1 for a fresh request.
-+
-+        Any other divisor points the precopy source outside the request's
-+        block-table row."""
-+        return (num_computed_tokens - 1) // mamba_block_size
+             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
  
      def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
-         super().add_request(req_index, new_req_data)
-@@ -109,8 +118,18 @@ def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+@@ -112,8 +113,20 @@
          self.num_accepted_tokens_gpu[req_index].fill_(1)
          if self._align_mode:
              # Seed the running state block from the resumed/prefilled position.
++            # Use the mamba group's block size (the state grid), NOT the generic
++            # cache_config.block_size (the min over all groups); a finer divisor
++            # points the precopy source outside the request's block-table row.
++            # (vLLM #53798)
 +            assert (
 +                new_req_data.num_computed_tokens == 0
 +                or self._mamba_block_size is not None
@@ -29,20 +23,18 @@ index c8ccde34fee4..1385edd27fd3 100644
 +                "request admitted with computed tokens before the mamba block "
 +                "size was resolved; seeding would corrupt the precopy source"
 +            )
++            mamba_block_size = self._mamba_block_size or self.cache_config.block_size
              self._mamba_state_idx_gpu[req_index].fill_(
 -                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
-+                self._seed_state_block_idx(
-+                    new_req_data.num_computed_tokens,
-+                    self._mamba_block_size or self.cache_config.block_size,
-+                )
++                (new_req_data.num_computed_tokens - 1) // mamba_block_size
              )
  
      def _get_mamba_group_info(
-@@ -128,6 +147,7 @@ def _get_mamba_group_info(
-             assert all(specs[0] == s for s in specs)
-             self._mamba_group_ids = group_ids
-             self._mamba_spec = specs[0]
-+            self._mamba_block_size = specs[0].block_size
+@@ -130,6 +143,7 @@
+             ), "all mamba groups must share cache scheduling parameters"
+             self._mamba_group_ids = get_mamba_group_ids(mamba_groups)
+             self._mamba_spec = mamba_spec
++            self._mamba_block_size = mamba_spec.block_size
          return self._mamba_group_ids, self._mamba_spec
  
      def _ensure_align_ctx(
