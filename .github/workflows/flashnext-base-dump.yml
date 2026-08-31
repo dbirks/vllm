@@ -6,6 +6,11 @@ name: flashnext-base-dump
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - flashnext-apc
+    paths:
+      - ".github/workflows/flashnext-base-dump.yml"
 
 permissions:
   contents: read
