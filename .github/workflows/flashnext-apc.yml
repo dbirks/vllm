@@ -1,0 +1,71 @@
+name: flashnext-apc
+
+# Builds and pushes ghcr.io/dbirks/vllm-flashnext:apc-a — the production sm120 overlay
+# PLUS two reviewed upstream hybrid-cache patches (vLLM #53798 + #54076), for the APC
+# experiment in home-k8s #115. Built FROM the pinned prod overlay digest, so it differs
+# from prod by only the patches. Standalone; does not touch vLLM's own CI.
+# See docker/flashnext-apc/PATCHES.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Rolling tag to publish (ghcr.io/dbirks/vllm-flashnext:<tag>)"
+        required: false
+        default: "apc-a"
+  push:
+    branches:
+      - flashnext-apc
+    paths:
+      - "docker/flashnext-apc/**"
+      - ".github/workflows/flashnext-apc.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/dbirks/vllm-flashnext
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - name: Resolve rolling tag
+        id: meta
+        run: echo "tag=${{ github.event.inputs.tag || 'apc-a' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/flashnext-apc
+          file: docker/flashnext-apc/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          pull: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+            ${{ env.IMAGE }}:apc-a-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
