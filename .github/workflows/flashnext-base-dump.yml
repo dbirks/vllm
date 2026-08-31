@@ -1,0 +1,51 @@
+name: flashnext-base-dump
+
+# One-off helper: extract the two APC patch-target files from the pinned Flash-Next
+# base overlay so patches can be anchored against the base's ACTUAL (customized) code,
+# not upstream main. Uploads them as an artifact. Manual dispatch only.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract target files from base image
+        run: |
+          set -eux
+          IMG=ghcr.io/dbirks/vllm-flashnext:sm120@sha256:f7186f70baf43061c042dfc8e9b296b75476f287b7c8d8394a7d2e287ed61e82
+          docker pull "$IMG"
+          cid=$(docker create "$IMG")
+          SITE=/usr/local/lib/python3.12/dist-packages
+          mkdir -p out
+          docker cp "$cid:$SITE/vllm/v1/worker/gpu/model_states/mamba_hybrid.py" out/mamba_hybrid.py
+          docker cp "$cid:$SITE/vllm/v1/core/sched/scheduler.py" out/scheduler.py
+          docker cp "$cid:$SITE/vllm/version.py" out/version.py || true
+          docker rm "$cid"
+          wc -l out/*.py
+
+      - name: Upload base files
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-files
+          path: out/
