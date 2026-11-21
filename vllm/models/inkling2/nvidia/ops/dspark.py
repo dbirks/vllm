@@ -4,6 +4,12 @@
 
 import torch
 
+# NVFP4 KV: the draft writes its paged cache through the same device helper
+# the target's attention prologue uses, so the two stay bit-for-bit alike.
+# The group size is passed to the kernel as a plain int (a bare `tl.constexpr`
+# object would not wrap alongside the raw `head_dim` int under the CPU
+# interpreter, where the writer's `D % GROUP` static assert runs).
+from vllm.models.inkling2.nvidia.ops.nvfp4_kv_write import nvfp4_store_kv_rows
 from vllm.triton_utils import tl, tldevice, triton
 
 
@@ -100,6 +106,126 @@ def write_kv_paged(
         PAGE=key_cache.shape[1],
         HEAD_DIM=head_dim,
         BLOCK_DIM=triton.next_power_of_2(head_dim),
+    )
+
+
+@triton.jit
+def _write_kv_nvfp4_kernel(
+    K,
+    V,
+    KEY_CACHE,
+    VALUE_CACHE,
+    SLOT_MAPPING,
+    NUM_TOKENS,
+    K_TOKEN_STRIDE,
+    K_HEAD_STRIDE,
+    V_TOKEN_STRIDE,
+    V_HEAD_STRIDE,
+    KC_BLOCK_STRIDE,
+    KC_PAGE_STRIDE,
+    KC_HEAD_STRIDE,
+    VC_BLOCK_STRIDE,
+    VC_PAGE_STRIDE,
+    VC_HEAD_STRIDE,
+    PAGE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    GROUP: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Store BLOCK_T token rows of one KV head as NVFP4, via the contract writer.
+
+    The uint8 `KEY_CACHE`/`VALUE_CACHE` (the split sides, last dim = packed row
+    width in bytes) are addressed exactly like the bf16 kernel's, so the same
+    (block, page, head) byte strides and the `slot < 0` skip apply.
+    """
+    token = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    head = tl.program_id(1)
+    tmask = token < NUM_TOKENS
+    tok = token.to(tl.int64)
+    kv_slot = tl.load(SLOT_MAPPING + token, mask=tmask, other=-1).to(tl.int64)
+
+    dim = tl.arange(0, HEAD_DIM)
+    k_src = K + tok[:, None] * K_TOKEN_STRIDE + head * K_HEAD_STRIDE + dim[None, :]
+    v_src = V + tok[:, None] * V_TOKEN_STRIDE + head * V_HEAD_STRIDE + dim[None, :]
+    yk = tl.load(k_src, mask=tmask[:, None], other=0.0).to(tl.float32)
+    yv = tl.load(v_src, mask=tmask[:, None], other=0.0).to(tl.float32)
+
+    nvfp4_store_kv_rows(
+        KEY_CACHE,
+        kv_slot,
+        yk,
+        PAGE,
+        KC_BLOCK_STRIDE,
+        KC_PAGE_STRIDE,
+        KC_HEAD_STRIDE,
+        head,
+        HEAD_DIM,
+        GROUP,
+    )
+    nvfp4_store_kv_rows(
+        VALUE_CACHE,
+        kv_slot,
+        yv,
+        PAGE,
+        VC_BLOCK_STRIDE,
+        VC_PAGE_STRIDE,
+        VC_HEAD_STRIDE,
+        head,
+        HEAD_DIM,
+        GROUP,
+    )
+
+
+def write_kv_paged_nvfp4(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Quantize K/V into an NVFP4 paged cache, matching `nvfp4_kv_ref`.
+
+    Same inputs as `write_kv_paged`, but `key_cache`/`value_cache` are the split
+    uint8 sides of a `[num_blocks, block_size, num_kv_heads, D // 2 + D // 16]`
+    cache (bytes), each row quantized with the target's `nvfp4_store_kv_rows`.
+    """
+    num_tokens = slot_mapping.numel()
+    num_heads, head_dim = k.shape[1], k.shape[2]
+    if num_tokens == 0 or num_heads == 0:
+        return
+    assert k.shape == v.shape
+    assert k.stride(2) == v.stride(2) == 1
+    assert key_cache.dtype == value_cache.dtype == torch.uint8
+    assert key_cache.stride(3) == value_cache.stride(3) == 1
+    assert key_cache.shape[:3] == value_cache.shape[:3]
+    assert key_cache.shape[2] == num_heads
+    row_bytes = head_dim // 2 + head_dim // 16
+    assert key_cache.shape[3] == row_bytes, (key_cache.shape, row_bytes)
+    assert head_dim & (head_dim - 1) == 0 and head_dim % 16 == 0
+
+    page = key_cache.shape[1]
+    block_t = min(8, triton.next_power_of_2(num_tokens))
+    _write_kv_nvfp4_kernel[(triton.cdiv(num_tokens, block_t), num_heads)](
+        k,
+        v,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        num_tokens,
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        key_cache.stride(0),
+        key_cache.stride(1),
+        key_cache.stride(2),
+        value_cache.stride(0),
+        value_cache.stride(1),
+        value_cache.stride(2),
+        PAGE=page,
+        HEAD_DIM=head_dim,
+        GROUP=16,
+        BLOCK_T=block_t,
     )
 
 

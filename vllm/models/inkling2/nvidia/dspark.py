@@ -6,12 +6,14 @@ recurrent (`rnn_hidden`) Markov head. Numerics follow the reference
 implementation's draft (flashinfer RMSNorms, bf16 logits)."""
 
 from collections.abc import Iterable
+from dataclasses import replace
 from typing import cast
 
 import torch
 from torch import nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config.cache import CacheDType  # NVFP4 KV: dtype for the backend gate
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -29,16 +31,24 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
+from vllm.utils.torch_utils import (
+    canonicalize_singleton_dim_strides,
+    nvfp4_kv_cache_full_dim,  # NVFP4 KV: packed row width (D//2 + D//16)
+)
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionImpl,
     FlashAttentionMetadata,
 )
+from vllm.v1.core.single_type_kv_cache_manager import (
+    DFlashSlidingWindowManager,  # NVFP4 KV: context-KV draft sliding window
+)
+from vllm.v1.kv_cache_interface import KVCacheLayerConfig
 from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
 
 from ..configs import Inkling2DSparkConfig
 from ..speculator_config import Inkling2DSparkSpeculatorConfig
+from .attention import _kv_cache_layer_config  # NVFP4 KV: target's packed spec
 from .ops.attention import block_decode_attention, plan_decode_attention
 from .ops.dspark import (
     add_softcap,
@@ -48,6 +58,7 @@ from .ops.dspark import (
     rope_,
     silu_and_mul,
     write_kv_paged,
+    write_kv_paged_nvfp4,
 )
 from .ops.linear import linear
 
@@ -117,6 +128,96 @@ def all_reduce_add_rmsnorm(
     return x
 
 
+class Inkling2DraftAttentionBackend(FlashAttentionBackend):
+    """NVFP4 KV: the draft's paged cache, read/written only by the Inkling2
+    SM12x kernels (`_write_kv` / `block_decode_attention`), never the flash_attn
+    C++ kernels. Accept `nvfp4` like `Inkling2AttentionBackend` does, so the
+    draft layer's spec survives backend selection and `supports_combination`
+    (which otherwise rejects a quantized KV dtype the C++ kernels lack).
+    """
+
+    @classmethod
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
+        # NVFP4 KV: only the draft's packed fp4 + fp8-scale cache is new here;
+        # every other dtype defers to FlashAttention's own table.
+        if kv_cache_dtype == "nvfp4":
+            return True
+        return super().supports_kv_cache_dtype(kv_cache_dtype)
+
+    @classmethod
+    def supports_combination(cls, *args, **kwargs) -> str | None:
+        # NVFP4 KV: skip the C++ flash_attn quantized-dtype probe for nvfp4 (the
+        # draft runs its own KV kernels); every other check still applies.
+        kv_dtype = kwargs.get("kv_cache_dtype")
+        if kv_dtype is None and len(args) > 2:
+            kv_dtype = args[2]  # parent signature: 3rd positional parameter
+        if kv_dtype == "nvfp4":
+            return None
+        return super().supports_combination(*args, **kwargs)
+
+
+class Inkling2DraftAttention(Attention):
+    """NVFP4 KV: the draft's `Attention`, kept as a plain BF16 layer (so the
+    `FlashAttentionImpl` it builds is never handed the packed cache) but whose
+    KV-cache *spec* is the target's packed NVFP4 layout when `nvfp4_kv` is set:
+    `[B, H, N, 2 * row]` uint8, `row = D // 2 + D // 16`, `kv_quant_mode NVFP4`,
+    `state_content_bytes 2 * row` -- so the page is the same size and layout as
+    the target's NVFP4 layers and the SM12x read kernels take their NVFP4 path.
+    Sliding-window draft layers keep their window (and the DFlash manager the
+    generic layer selects for the context-KV writer).
+    """
+
+    def __init__(self, *args, nvfp4_kv: bool = False, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.nvfp4_kv = nvfp4_kv
+
+    def get_attn_backend(self) -> type[FlashAttentionBackend]:
+        # NVFP4 KV: the nvfp4 spec needs a backend that accepts the dtype.
+        if self.nvfp4_kv:
+            return Inkling2DraftAttentionBackend
+        return self.attn_backend
+
+    def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig | None:
+        # NVFP4 KV: emit the packed uint8 spec for the draft. The BF16/FP8
+        # paths are untouched. The runner calls this with the *target's*
+        # VllmConfig, whose cache_config.cache_dtype may differ from the draft's
+        # (they are configured independently), so override it to "nvfp4" for the
+        # draft's own sizing -- this also makes the draft's block size match the
+        # target's packed layers, so their pages unify without padding.
+        if not self.nvfp4_kv:
+            return super().get_kv_cache_config(vllm_config)
+        vllm_config = replace(
+            vllm_config,
+            cache_config=replace(vllm_config.cache_config, cache_dtype="nvfp4"),
+        )
+        config = _kv_cache_layer_config(
+            vllm_config,
+            self.num_kv_heads,
+            self.head_size,
+            self.sliding_window,
+        )
+        if (
+            self.sliding_window is not None
+            and self.is_draft_layer
+            and vllm_config.speculative_config is not None
+            # Same test as vllm Attention.get_kv_cache_config for the DFlash
+            # context-KV writer (it skips null block-table entries).
+            and vllm_config.speculative_config.method in ("dflash", "dspark")
+        ):
+            # NVFP4 KV: the context-KV writer skips null block-table entries, so
+            # local draft layers need the DFlash sliding-window manager the
+            # generic draft Attention selects (the target's helper used the plain
+            # one); keep the same packed spec, swap only the manager.
+            config = DFlashSlidingWindowManager.layer_config(
+                config.spec,
+                sliding_window=self.sliding_window,
+                num_speculative_tokens=vllm_config.num_speculative_tokens,
+                max_in_flight_steps=vllm_config.max_concurrent_batches,
+                num_lookahead_tokens=vllm_config.num_lookahead_tokens,
+            )
+        return config
+
+
 class Inkling2DraftSelfAttention(nn.Module):
     """Bidirectional block attention over context K/V (from target features)
     and the block itself; local layers see `sliding_window_size` positions
@@ -159,10 +260,28 @@ class Inkling2DraftSelfAttention(nn.Module):
         self.q_norm = _RMSNorm(self.head_dim, self.eps)
         self.k_norm = _RMSNorm(self.head_dim, self.eps)
         self.k_norm_ctx = _RMSNorm(self.head_dim, self.eps)
+        # NVFP4 KV: the draft's own cache dtype, from `SpeculativeConfig`
+        # (`--speculative-config '{..., "kv_cache_dtype": "nvfp4"}'`), which
+        # `speculator_config.py` admits alongside auto/bfloat16 on SM12x. NVFP4
+        # has per-16-element E4M3 scales, so unlike the target's unit-scale FP8
+        # it can hold the draft's unnormalized values (max |x| = 448 * 6 = 2688).
+        # This is the *draft's* dtype; the target's --kv-cache-dtype never
+        # reaches it. The value also lands on the draft's own cache_config here.
+        vllm_config = get_current_vllm_config()
+        self.nvfp4_kv = (
+            current_platform.is_device_capability_family(120)
+            and vllm_config.cache_config.cache_dtype == "nvfp4"
+        )
+        # Packed row width (bytes) the uint8 cache splits into, else head_dim.
+        self.kv_row_bytes = (
+            nvfp4_kv_cache_full_dim(self.head_dim) if self.nvfp4_kv else self.head_dim
+        )
         # Owns the paged KV cache only; the same spec as the target's layers
         # (the scheduler keeps the last sliding_window_size positions before
-        # the block, which is what the draft reads).
-        self.attn = Attention(
+        # the block, which is what the draft reads). In nvfp4 mode the layer is
+        # an Inkling2DraftAttention, whose spec is the target's packed NVFP4
+        # page while the BF16 layer it wraps is never asked to read/write it.
+        self.attn = Inkling2DraftAttention(
             self.num_heads,
             self.head_dim,
             self.head_dim**-0.5,
@@ -170,10 +289,10 @@ class Inkling2DraftSelfAttention(nn.Module):
             per_layer_sliding_window=config.sliding_window_size if is_local else None,
             prefix=f"{prefix}.attn",
             attn_backend=FlashAttentionBackend,
+            nvfp4_kv=self.nvfp4_kv,
         )
         # Keys a block sees: itself and, if local, the window before it.
         self.window = config.sliding_window_size + self.block if is_local else 0
-        vllm_config = get_current_vllm_config()
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.register_buffer(
             "cu_seqlens_q",
@@ -192,6 +311,17 @@ class Inkling2DraftSelfAttention(nn.Module):
     ) -> None:
         impl = cast(FlashAttentionImpl, self.attn.impl)
         cache = self.attn.kv_cache
+        if self.nvfp4_kv:
+            # NVFP4 KV: the uint8 page keeps the fp8 strides; K and V are the
+            # first/second `D // 2 + D // 16` bytes of each head slot, so the
+            # split is at the packed row width (72 at D=128), not head_dim. The
+            # SM120 path must go through our kernel: the FlashAttentionImpl would
+            # misread the packed rows as dense elements.
+            key_cache, value_cache = cache.transpose(1, 2).split(
+                self.kv_row_bytes, dim=-1
+            )
+            write_kv_paged_nvfp4(k, v, key_cache, value_cache, slot_mapping)
+            return
         if (
             current_platform.is_device_capability_family(120)
             and impl.kv_cache_dtype == "auto"
@@ -226,7 +356,11 @@ class Inkling2DraftSelfAttention(nn.Module):
                 md.slot_mapping[: q.shape[0]],
             )
             key_cache, value_cache = self.attn.kv_cache.transpose(1, 2).split(
-                self.head_dim, dim=-1
+                # NVFP4 KV: split at the packed row width so block_decode_
+                # attention sees 72-byte rows and rel_attention takes its NVFP4
+                # path; equals head_dim on the bf16/fp8 paths.
+                self.kv_row_bytes,
+                dim=-1,
             )
             num_reqs = min(q.shape[0] // self.block, md.seq_lens.shape[0])
             num_tokens = num_reqs * self.block
