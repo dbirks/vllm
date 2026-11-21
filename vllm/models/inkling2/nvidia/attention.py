@@ -7,8 +7,9 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import cast
 
+import os
+
 import numpy as np
-import math
 
 import torch
 from torch import nn
@@ -167,17 +168,20 @@ def _kv_cache_layer_config(
     )
     block_size = vllm_config.cache_config.block_size
     if packed:
-        # NVFP4 KV: vLLM gives every KV-cache group one page size and only scales
-        # a smaller page's block size by an INTEGER ratio, else pads it to the
-        # largest page. The DSpark draft keeps a dense BF16 cache (2*D*2 bytes per
-        # head-token = 512 at D=128) next to our 144-byte head-token, a 3.56x ratio,
-        # so a block-16 NVFP4 page would be padded to the draft's page size and use
-        # MORE memory than fp8. Make our page a multiple of the same-heads BF16 page:
-        # 512 / gcd(144, 512) = 32 -> 512-token blocks, which the draft (block 16)
-        # then matches by scaling its own block size 9x. Kernels read PAGE from the
-        # cache tensor's shape, so nothing else changes.
-        dense_bf16 = 2 * head_dim * 2
-        block_size *= dense_bf16 // math.gcd(state_content_bytes, dense_bf16)
+        # NVFP4 KV: vLLM gives every KV-cache group one page size: a smaller page
+        # whose size divides the largest gets a proportionally larger block, any
+        # other attention page is PADDED to the largest. Our rows are 144 bytes per
+        # head-token (9 x 16) next to power-of-two BF16 pages (the DSpark draft's
+        # full-attention cache, 512 B/head-token, and the small sconv windows), so
+        # at equal block sizes our ~48 per-pass caches got padded up to the draft's
+        # page (more memory than fp8). Multiplying our block size fixes that, at a
+        # price: prefix-cache hits align to the LCM of all group block sizes.
+        # Measured on an RTX 5090 (DSpark, 2 seqs): x8 -> pool 372K at 360K context,
+        # hits align to 4,608 tokens (the draft is padded 2.25x); x32 -> 466K at 384K,
+        # no padding, but 18,432-token hit alignment (TTFT 5.4 s vs 0.5 s on a
+        # repeated 23.5K prompt). Override with INKLING_NVFP4_BLOCK_MULT.
+        # Kernels read PAGE from the cache tensor's shape, so nothing else changes.
+        block_size *= int(os.environ.get("INKLING_NVFP4_BLOCK_MULT", "8"))
     spec = AttentionSpec(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
