@@ -19,15 +19,16 @@ reference and the compiled CUDA path.
 
 from vllm.triton_utils import tl, triton
 
+# tl.constexpr: compiled @triton.jit code can only read module globals that are constexpr.
 # Elements per NVFP4 scale group, and the value a group scale divides by.
-NVFP4_GROUP = 16
-_NVFP4_AMAX_DIV = 6.0
+NVFP4_GROUP = tl.constexpr(16)
+_NVFP4_AMAX_DIV = tl.constexpr(6.0)
 # Smallest E4M3 normal (2^-6), largest E4M3 finite value, E4M3 subnormal step.
-_E4M3_MIN_NORMAL = 0.015625
-_E4M3_MAX = 448.0
-_E4M3_SUBNORMAL_SCALE = 512.0  # 2^9 = 1 / subnormal step
+_E4M3_MIN_NORMAL = tl.constexpr(0.015625)
+_E4M3_MAX = tl.constexpr(448.0)
+_E4M3_SUBNORMAL_SCALE = tl.constexpr(512.0)  # 2^9 = 1 / subnormal step
 # fp32 magic constant for ties-to-even rounding to integers (double rounding).
-_ROUND_MAGIC = 8388608.0  # 2^23
+_ROUND_MAGIC = tl.constexpr(8388608.0)  # 2^23
 
 
 @triton.jit

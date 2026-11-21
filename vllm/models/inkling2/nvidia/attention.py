@@ -8,6 +8,8 @@ from functools import partial
 from typing import cast
 
 import numpy as np
+import math
+
 import torch
 from torch import nn
 
@@ -163,8 +165,21 @@ def _kv_cache_layer_config(
         if packed
         else None
     )
+    block_size = vllm_config.cache_config.block_size
+    if packed:
+        # NVFP4 KV: vLLM gives every KV-cache group one page size and only scales
+        # a smaller page's block size by an INTEGER ratio, else pads it to the
+        # largest page. The DSpark draft keeps a dense BF16 cache (2*D*2 bytes per
+        # head-token = 512 at D=128) next to our 144-byte head-token, a 3.56x ratio,
+        # so a block-16 NVFP4 page would be padded to the draft's page size and use
+        # MORE memory than fp8. Make our page a multiple of the same-heads BF16 page:
+        # 512 / gcd(144, 512) = 32 -> 512-token blocks, which the draft (block 16)
+        # then matches by scaling its own block size 9x. Kernels read PAGE from the
+        # cache tensor's shape, so nothing else changes.
+        dense_bf16 = 2 * head_dim * 2
+        block_size *= dense_bf16 // math.gcd(state_content_bytes, dense_bf16)
     spec = AttentionSpec(
-        block_size=vllm_config.cache_config.block_size,
+        block_size=block_size,
         num_kv_heads=num_kv_heads,
         head_size=head_dim,
         dtype=dtype,
