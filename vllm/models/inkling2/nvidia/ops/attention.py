@@ -18,7 +18,10 @@ from vllm.models.inkling.nvidia.ops.fa4_rel_attention import (
 )
 from vllm.triton_utils import gl, gluon, tl, tldevice, triton
 from vllm.utils.platform_utils import num_compute_units
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import (
+    kv_cache_dtype_str_to_dtype,
+    nvfp4_kv_cache_full_dim,  # NVFP4 KV
+)
 
 from . import use_sm100_kernels
 from .attention_sm90 import MODE_GATED, MODE_PARTIAL, rel_attention
@@ -98,6 +101,9 @@ class Inkling2FA4RelAttentionKernel(
         # Split-KV scheduler warps bucket; None without the scheduler.
         num_warps_bucket: int | None
         large_num_reqs: bool
+        # NVFP4 KV: packed D//2 + D//16-byte cache rows instead of D elements
+        # (kv_dtype is the uint8 storage either way, so it cannot tell them apart).
+        nvfp4_kv: bool = False
 
     @staticmethod
     def kernel(
@@ -150,9 +156,12 @@ class Inkling2FA4RelAttentionKernel(
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         dtype = vllm_config.model_config.dtype
+        # NVFP4 KV: "nvfp4" already maps to uint8 storage here (as "fp8" does),
+        # so only the row width below differs from the fp8 path.
         kv_dtype = kv_cache_dtype_str_to_dtype(
             vllm_config.cache_config.cache_dtype, vllm_config.model_config
         )
+        nvfp4_kv = vllm_config.cache_config.cache_dtype == "nvfp4"  # NVFP4 KV
         assert config.swa_num_attention_heads == config.num_attention_heads
         assert config.swa_num_key_value_heads == config.num_key_value_heads
         assert config.swa_head_dim == config.head_dim
@@ -188,6 +197,7 @@ class Inkling2FA4RelAttentionKernel(
                             split_kv=split_kv,
                             num_warps_bucket=bucket,
                             large_num_reqs=max_num_reqs > 1024,
+                            nvfp4_kv=nvfp4_kv,  # NVFP4 KV
                         )
                     )
                 max_seqlen_q *= 2
@@ -213,7 +223,8 @@ class Inkling2FA4RelAttentionKernel(
                 2,
                 key.block_size,
                 key.num_kv_heads,
-                key.head_dim,
+                # NVFP4 KV: a row is D//2 + D//16 packed bytes, not D elements.
+                nvfp4_kv_cache_full_dim(key.head_dim) if key.nvfp4_kv else key.head_dim,
                 dtype=key.kv_dtype,
                 device=device,
             )
@@ -1220,6 +1231,12 @@ def _decode_attention(
         extent = rel_logits.shape[2] - 2 * _FA4_BLOCK_N
     assert max_query_len <= _VERIFY_BLOCK_M // group
     assert key_cache.stride() == value_cache.stride() and key_cache.stride(3) == 1
+    # NVFP4 KV: `_rel_verify_kernel` loads K|V rows as bf16/fp8 elements through
+    # a TMA descriptor, so it cannot unpack NVFP4 rows; NVFP4 runs on the SM12x
+    # kernels (rel_attention), which read the packed rows themselves.
+    nvfp4_kv = key_cache.shape[-1] == nvfp4_kv_cache_full_dim(head_dim)
+    if nvfp4_kv and use_sm100_kernels():
+        raise NotImplementedError("NVFP4 KV cache needs the SM12x attention kernels")
     assert q.stride(1) == head_dim and q.stride(2) == 1
     assert out.is_contiguous()
     # A single split writes the (gated) output itself.

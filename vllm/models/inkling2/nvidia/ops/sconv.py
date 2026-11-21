@@ -25,7 +25,12 @@ RMS-normalizes V per head and writes both to the paged KV cache.
 import torch
 
 from vllm.models.inkling2.nvidia.ops.norm import qr_clip_rel_tokens, rsqrt
+from vllm.models.inkling2.nvidia.ops.nvfp4_kv_write import (
+    NVFP4_GROUP,
+    nvfp4_store_kv_rows,
+)
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim  # NVFP4 KV
 
 
 @triton.jit
@@ -553,6 +558,7 @@ def _attn_prologue_kernel(
     BLOCK_E: tl.constexpr,
     QR_TOKENS: tl.constexpr,
     FUSE_QR: tl.constexpr,
+    KV_NVFP4: tl.constexpr,  # NVFP4 KV: KV cache rows are packed NVFP4, not D elements
 ):
     tl.extra.cuda.gdc_wait()
     # The decode attention kernel prefetches cached keys meanwhile.
@@ -634,6 +640,7 @@ def _attn_prologue_kernel(
             D,
             DYNAMIC,
             BT,
+            KV_NVFP4,
         )
 
 
@@ -745,6 +752,7 @@ def _kv_conv_tile(
     D: tl.constexpr,
     DYNAMIC: tl.constexpr,
     BT: tl.constexpr,
+    KV_NVFP4: tl.constexpr,  # NVFP4 KV: store D//2 + D//16 packed bytes per row
 ):
     toff = tl.program_id(0) * BT + tl.arange(0, BT)
     head = tl.program_id(1)
@@ -803,14 +811,30 @@ def _kv_conv_tile(
         cache = key_cache_ptr
     kv_slot = tl.load(kv_slot_ptr + toff, mask=t_mask, other=-1)
     safe = tl.maximum(kv_slot, 0)
-    dst = (
-        cache
-        + (safe // kv_block_size)[:, None] * stride_kv_blk
-        + (safe % kv_block_size)[:, None] * stride_kv_n
-        + head * stride_kv_h
-        + d_idx[None, :]
-    )
-    tl.store(dst, y.to(cache.dtype.element_ty), mask=(kv_slot >= 0)[:, None])
+    if KV_NVFP4:
+        # NVFP4 KV: the row is D//2 packed E2M1 bytes + D//16 E4M3 scale bytes
+        # at the same (block, slot, head) start; the uint8 strides are bytes.
+        nvfp4_store_kv_rows(
+            cache,
+            kv_slot,
+            y,
+            kv_block_size,
+            stride_kv_blk,
+            stride_kv_n,
+            stride_kv_h,
+            head,
+            D,
+            NVFP4_GROUP,
+        )
+    else:
+        dst = (
+            cache
+            + (safe // kv_block_size)[:, None] * stride_kv_blk
+            + (safe % kv_block_size)[:, None] * stride_kv_n
+            + head * stride_kv_h
+            + d_idx[None, :]
+        )
+        tl.store(dst, y.to(cache.dtype.element_ty), mask=(kv_slot >= 0)[:, None])
 
 
 # From this many tokens, q/r run in their own launch (8 tokens per program)
@@ -879,7 +903,13 @@ def attention_prologue(
     `k/v_dynamic` the `(W, H * D)` static part.
     """
     num_tokens = kv_slot_mapping.shape[0]
-    num_heads, head_dim = key_cache.shape[2:]
+    num_heads, kv_row_bytes = key_cache.shape[2:]
+    # NVFP4 KV: the KV cache's last dim is the packed row width (D//2 + D//16
+    # bytes) instead of head_dim elements, so head_dim comes from q and the
+    # writer mode from the row width.
+    head_dim = q.shape[2]
+    kv_nvfp4 = kv_row_bytes == nvfp4_kv_cache_full_dim(head_dim)
+    assert kv_nvfp4 or kv_row_bytes == head_dim
     num_q_heads, d_rel = r.shape[1:]
     extent = rel_proj.shape[2] - _SHIFT_PAD
     assert rel_proj.shape[:2] == (8, d_rel + 1)
@@ -978,6 +1008,7 @@ def attention_prologue(
         BLOCK_E=block_e,
         QR_TOKENS=triton.cdiv(block_t, num_heads),
         FUSE_QR=not qr_tokens,
+        KV_NVFP4=kv_nvfp4,  # NVFP4 KV
         num_warps=4,
         enable_fp_fusion=False,
         launch_pdl=True,

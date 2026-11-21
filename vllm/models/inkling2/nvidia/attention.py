@@ -13,6 +13,8 @@ from torch import nn
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
+# NVFP4 KV: CacheDType for the backend's supports_kv_cache_dtype override.
+from vllm.config.cache import CacheDType
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -29,7 +31,10 @@ from vllm.models.inkling.nvidia.sconv_swa_attn import InklingConvState
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
+    get_dtype_size,
     kv_cache_dtype_str_to_dtype,
+    # NVFP4 KV: packed row width helper (D // 2 fp4 data + D // 16 fp8 scales).
+    nvfp4_kv_cache_full_dim,
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -46,7 +51,8 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
     SlidingWindowManager,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
+# NVFP4 KV: KVQuantMode marks the packed fp4 cache in the layer spec.
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig, KVQuantMode
 
 from ..configs import Inkling2ModelConfig
 from .lora import add_linear_lora
@@ -109,6 +115,30 @@ class Inkling2AttentionBackend(FlashAttentionBackend):
     def get_builder_cls() -> type[FlashAttentionMetadataBuilder]:
         return Inkling2AttentionMetadataBuilder
 
+    # NVFP4 KV: Inkling2 reads/writes its KV with its own Triton/tilelang
+    # kernels, never the flash_attn C++ kernels, so the FA KV-dtype table does
+    # not apply. Accept the dtypes `Inkling2Attention.__init__` allows (it is
+    # the authority and gates `nvfp4` on the SM120 device capability family).
+    @classmethod
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
+        if kv_cache_dtype == "nvfp4":
+            return True
+        return super().supports_kv_cache_dtype(kv_cache_dtype)
+
+    @classmethod
+    def supports_combination(cls, *args, **kwargs) -> str | None:
+        # NVFP4 KV: the parent rejects a quantized KV dtype that the C++
+        # flash-attn kernels do not implement (`is_quantized_kv_cache` ->
+        # `flash_attn_supports_kv_cache_dtype`). Inkling2 runs its own KV
+        # kernels, so skip that probe for nvfp4; every other combination check
+        # (and the layer's own dtype gate) still applies.
+        kv_dtype = kwargs.get("kv_cache_dtype")
+        if kv_dtype is None and len(args) > 2:
+            kv_dtype = args[2]  # parent signature: 3rd positional parameter
+        if kv_dtype == "nvfp4":
+            return None
+        return super().supports_combination(*args, **kwargs)
+
 
 def _kv_cache_layer_config(
     vllm_config: VllmConfig,
@@ -116,13 +146,30 @@ def _kv_cache_layer_config(
     head_dim: int,
     sliding_window: int | None,
 ) -> KVCacheLayerConfig:
+    cache_dtype = vllm_config.cache_config.cache_dtype
+    dtype = kv_cache_dtype_str_to_dtype(cache_dtype, vllm_config.model_config)
+    # NVFP4 KV: the page keeps the fp8 layout `[B, H, N, 2 * row]` of uint8
+    # bytes (K row then V row per head slot), only the row narrows from D
+    # bytes to `nvfp4_kv_cache_full_dim(D)` = D//2 + D//16 (72 at D=128), so
+    # one page is `num_kv_heads * block_size * 2 * 72` bytes instead of the
+    # fp8 `num_kv_heads * block_size * 2 * 128`. `head_size` stays the logical
+    # D; `state_content_bytes` is how this copy of vLLM expresses a packed
+    # page (see `AttentionSpec.state_content_size_bytes`, used by
+    # `compute_layer_kv_cache_shape_bytes` / `page_size_bytes`).
+    packed = cache_dtype == "nvfp4"
+    # Bytes of one (kv head, token): the K row and the V row side by side.
+    state_content_bytes = (
+        2 * nvfp4_kv_cache_full_dim(head_dim) * get_dtype_size(dtype)
+        if packed
+        else None
+    )
     spec = AttentionSpec(
         block_size=vllm_config.cache_config.block_size,
         num_kv_heads=num_kv_heads,
         head_size=head_dim,
-        dtype=kv_cache_dtype_str_to_dtype(
-            vllm_config.cache_config.cache_dtype, vllm_config.model_config
-        ),
+        dtype=dtype,
+        kv_quant_mode=KVQuantMode.NVFP4 if packed else KVQuantMode.NONE,
+        state_content_bytes=state_content_bytes,
     )
     if sliding_window is not None:
         return SlidingWindowManager.layer_config(spec, sliding_window=sliding_window)
@@ -292,10 +339,19 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         cache_dtype = vllm_config.cache_config.cache_dtype
         supported: tuple[str, ...] = ("auto", "bfloat16")
         if current_platform.is_device_capability_family(120):
-            supported += ("float16", "fp8", "fp8_e4m3")
+            # NVFP4 KV: SM12x also serves the packed fp4 + fp8-scale cache.
+            supported += ("float16", "fp8", "fp8_e4m3", "nvfp4")
         if cache_dtype not in supported:
             raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
-        self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
+        # NVFP4 KV: one mode instead of a bool. "bf16" covers every dense
+        # (unquantized) cache, including float16; the fp8 and bf16 paths below
+        # are unchanged by the nvfp4 branch.
+        if cache_dtype == "nvfp4":
+            self.kv_mode = "nvfp4"
+        elif cache_dtype in ("fp8", "fp8_e4m3"):
+            self.kv_mode = "fp8"
+        else:
+            self.kv_mode = "bf16"
         if cache_dtype == "float16" and vllm_config.speculative_config is not None:
             raise ValueError("Inkling2 FP16 KV requires speculative decoding disabled")
         self.kv_cache = torch.tensor([])
@@ -308,6 +364,11 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
 
     def process_weights_after_loading(self) -> None:
         self.rel_proj_shifted = shift_rel_proj(self.rel_logits_proj, self.is_local)
+
+    @property
+    def fp8_kv(self) -> bool:
+        """NVFP4 KV: kept for readers of the old flag; True only for fp8."""
+        return self.kv_mode == "fp8"
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return Inkling2AttentionBackend
@@ -350,7 +411,19 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
     def _split_kv_cache(
         self, kv_cache: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.fp8_kv:
+        if self.kv_mode == "nvfp4":
+            # NVFP4 KV: the page stays uint8 and keeps the fp8 strides; K and V
+            # are the first/second `D//2 + D//16` bytes of each head slot, so
+            # the split is at the packed row width (72 at D=128), not head_dim.
+            row_bytes = nvfp4_kv_cache_full_dim(self.head_dim)
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(
+                row_bytes, dim=-1
+            )
+            return (
+                canonicalize_singleton_dim_strides(key_cache),
+                canonicalize_singleton_dim_strides(value_cache),
+            )
+        if self.kv_mode == "fp8":
             # Every loop pass owns byte storage containing unit-scale E4M3 KV.
             kv_cache = kv_cache.view(torch.float8_e4m3fn)
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)

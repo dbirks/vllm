@@ -56,6 +56,52 @@ def _load_fp8_kv(ptr, offsets, mask, dtype: tl.constexpr, D: tl.constexpr):
     return tl.interleave(lo, hi).to(dtype)
 
 
+# NVFP4 KV: E2M1 nibble -> float, portable ops only (no inline PTX) so the
+# Triton CPU interpreter can run it. Bit 3 is the sign, bits 0-2 the magnitude
+# code {0, 0.5, 1, 1.5, 2, 3, 4, 6}: code = e << 1 | f with a 1-biased
+# exponent, so e == 0 is the 0.5 subnormal and e >= 1 is 2**(e - 1) * (1 + f/2).
+@triton.jit
+def _nvfp4_e2m1(nib):
+    code = nib & 7
+    # code >= 2 is normal: the f32 bit pattern is (126 + e) exponent, f mantissa
+    # bit, and those fields are exactly `code << 22`, so one shift and one add.
+    mag = tl.where(
+        code >= 2,
+        ((code << 22) + (126 << 23)).to(tl.float32, bitcast=True),
+        code.to(tl.float32) * 0.5,
+    )
+    return tl.where(nib >= 8, -mag, mag)
+
+
+# NVFP4 KV: dequantize a [rows, D] tile of cache rows of `D // 2` packed E2M1
+# bytes (element 2j in the low nibble) plus `D // 16` FP8 E4M3 group scales,
+# i.e. the layout of nvidia/ops/nvfp4_kv_ref.py. `offsets` are byte offsets of
+# the row starts (the cache strides are in bytes for the uint8 cache). Same
+# [BLOCK_N, D] orientation as `_load_fp8_kv`; the caller transposes for K.
+@triton.jit
+def _load_nvfp4_kv(ptr, offsets, mask, dtype: tl.constexpr, D: tl.constexpr):
+    rows = ptr.to(tl.pointer_type(tl.uint8)) + offsets[:, None]
+    half = tl.arange(0, D // 2)
+    packed = tl.load(rows + half[None, :], mask=mask[:, None], other=0)
+    vals = tl.interleave(
+        _nvfp4_e2m1((packed & 0xF).to(tl.int32)),
+        _nvfp4_e2m1((packed >> 4).to(tl.int32)),
+    )
+    # One E4M3 scale per 16 elements; a masked/zero group reads as scale 0.
+    groups = tl.arange(0, D // 16)
+    scales = (
+        tl.load(rows + (D // 2) + groups[None, :], mask=mask[:, None], other=0)
+        .to(tl.float8e4nv, bitcast=True)
+        .to(tl.float32)
+    )
+    # Broadcast each scale over its group by doubling 4 times (16 = 2**4).
+    scales = tl.interleave(scales, scales)
+    scales = tl.interleave(scales, scales)
+    scales = tl.interleave(scales, scales)
+    scales = tl.interleave(scales, scales)
+    return (vals * scales).to(dtype)
+
+
 @triton.jit
 def _rel_attention_kernel(
     Q,
@@ -88,6 +134,7 @@ def _rel_attention_kernel(
     H: tl.constexpr,
     G: tl.constexpr,
     D: tl.constexpr,
+    KV_NVFP4: tl.constexpr,
     E: tl.constexpr,
     PAGE: tl.constexpr,
     WINDOW: tl.constexpr,
@@ -158,7 +205,9 @@ def _rel_attention_kernel(
         kv_ptrs = (
             page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
         )
-        if K.dtype.element_ty.primitive_bitwidth == 8:
+        if KV_NVFP4:  # NVFP4 KV: uint8 rows, D // 2 packed bytes + D // 16 scales.
+            k = _load_nvfp4_kv(K, kv_ptrs, key_valid, q.dtype, D).T
+        elif K.dtype.element_ty.primitive_bitwidth == 8:
             k = _load_fp8_kv(K, kv_ptrs, key_valid, q.dtype, D).T
         else:
             k = tl.load(
@@ -181,7 +230,9 @@ def _rel_attention_kernel(
         alpha = tl.exp2(m_i - m_safe)
         p = tl.exp2(s - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        if V.dtype.element_ty.primitive_bitwidth == 8:
+        if KV_NVFP4:  # NVFP4 KV
+            v = _load_nvfp4_kv(V, kv_ptrs, key_valid, q.dtype, D)
+        elif V.dtype.element_ty.primitive_bitwidth == 8:
             v = _load_fp8_kv(V, kv_ptrs, key_valid, q.dtype, D)
         else:
             v = tl.load(
@@ -269,6 +320,10 @@ def rel_attention(
     num_tokens, num_heads, head_dim = q.shape
     page, num_kv_heads = key_cache.shape[1:3]
     group = num_heads // num_kv_heads
+    # NVFP4 KV: the uint8 cache rows are D // 2 packed E2M1 bytes plus D // 16
+    # E4M3 scales (72 bytes at D=128) instead of D FP8 values; the byte row
+    # start is already the element offset the kernel used to index.
+    kv_nvfp4 = key_cache.shape[-1] == head_dim // 2 + head_dim // 16
     assert key_cache.stride() == value_cache.stride() and key_cache.stride(3) == 1
     assert q.stride(2) == 1
     assert mode != MODE_GATED or num_splits == 1
@@ -331,6 +386,7 @@ def rel_attention(
         H=num_heads,
         G=group,
         D=head_dim,
+        KV_NVFP4=kv_nvfp4,
         E=extent,
         PAGE=page,
         WINDOW=window,
